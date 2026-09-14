@@ -1,5 +1,4 @@
 pyTelegramBotAPI==4.14.0
 requests==2.31.0
-loguru==0.7.2
-configparser==6.0.1
-beautifulsoup4==4.12.3
+gspread==6.1.0
+google-auth==2.34.0
