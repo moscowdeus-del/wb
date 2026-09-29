@@ -1,404 +1,563 @@
 # -*- coding: utf-8 -*-
 """
-WB Jewelry Monitor — полное демо для собеседования.
-Меню + ключевые показатели: маржа, ROI, прибыль, скидка, рейтинг.
-"""
-import configparser
-import json
-import os
-import logging
+WB Demo — Telegram-бот мониторинга FBS.
+Все данные из PostgreSQL wb_demo. Локальный polling.
 
+Перед запуском:
+1. Вставь TOKEN от @BotFather
+2. Вставь ADMIN_ID (узнать: напиши @userinfobot в Telegram)
+3. pip install pyTelegramBotAPI pandas sqlalchemy "psycopg[binary]"
+4. python bot.py
+"""
 import telebot
 from telebot import types
-import gspread
-from google.oauth2.service_account import Credentials
-
-# ==================== ЛОГИ ====================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s'
-)
-logger = logging.getLogger(__name__)
+import pandas as pd
+from sqlalchemy import create_engine, text
+from datetime import datetime, timedelta
+import threading
+import time
+import traceback
 
 # ==================== НАСТРОЙКИ ====================
+TOKEN = "8483036781:AAHhqpdVe39EtuJdMrWho1BjwSH1cEfA3C8"
+ADMIN_ID = 6011810304  # ← твой chat_id (число), узнать: @userinfobot
+DB_URL = "postgresql+psycopg://postgres:1234@localhost:5432/wb_demo"
+PENALTY_RUB = 500
+TARGET_OVERDUE_PCT = 2.0
+BURNING_HOURS = 2       # за сколько часов до дедлайна считать «горящим»
+ALERT_INTERVAL_MIN = 30  # как часто проверять алерты (минут)
+DAILY_HOUR = 9          # во сколько слать утреннюю сводку
 
-def get_settings(section, key):
-    config = configparser.ConfigParser()
-    config.read('settings.ini', encoding='utf-8')
-    return config.get(section, key)
+engine = create_engine(DB_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-def get_float(section, key):
-    return float(get_settings(section, key))
 
-bot = telebot.TeleBot(token=get_settings('TELEGRAM', 'token'))
+# ==================== БД ====================
+def q(sql, params=None):
+    """Выполнить SQL, вернуть DataFrame."""
+    with engine.connect() as c:
+        return pd.read_sql(text(sql), c, params=params or {})
 
-# ==================== GOOGLE SHEETS ====================
 
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
-]
+def scalar(sql, params=None):
+    """Один скаляр."""
+    with engine.connect() as c:
+        return c.execute(text(sql), params or {}).scalar()
 
-def get_sheet():
-    if 'GOOGLE_CREDENTIALS' in os.environ:
-        creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
-        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    else:
-        creds = Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
-    client = gspread.authorize(creds)
-    return client.open_by_key(
-        get_settings('GOOGLE', 'spreadsheet_id')
-    ).worksheet(get_settings('GOOGLE', 'worksheet_name'))
 
-def load_products():
+def fmt(n):
+    """1234567 -> '1 234 567'"""
     try:
-        return get_sheet().get_all_records()
-    except Exception as e:
-        logger.error(f'Ошибка загрузки: {e}')
-        return []
+        return f"{int(n):,}".replace(",", " ")
+    except Exception:
+        return str(n)
 
-# ==================== КЛЮЧЕВЫЕ ПОКАЗАТЕЛИ ====================
 
-def calc_metrics(p):
-    """Считает ключевые показатели по одному SKU."""
-    try:
-        initial = float(p.get('initial_price', 0) or 0)
-        final = float(p.get('final_price', 0) or 0)
-        rating = float(p.get('rating', 0) or 0)
-        reviews = int(p.get('review_count', 0) or 0)
-        
-        if final <= 0:
-            return None
-        
-        # Комиссия WB
-        commission = round(final * get_float('ECONOMICS', 'commission_pct') / 100, 2)
-        # Себестоимость
-        cost = round(initial * get_float('ECONOMICS', 'cost_pct') / 100, 2)
-        # Логистика + хранение
-        logistics = get_float('ECONOMICS', 'logistics')
-        storage = get_float('ECONOMICS', 'storage')
-        
-        # Прибыль
-        profit = round(final - commission - logistics - storage - cost, 2)
-        # Маржа %
-        margin = round(profit / final * 100, 1)
-        # ROI %
-        roi = round(profit / cost * 100, 1) if cost > 0 else 0
-        # Скидка %
-        discount = round((initial - final) / initial * 100, 1) if initial > 0 else 0
-        
-        return {
-            'commission': commission,
-            'cost': cost,
-            'profit': profit,
-            'margin': margin,
-            'roi': roi,
-            'discount': discount,
-            'rating': rating,
-            'reviews': reviews,
-        }
-    except (ValueError, TypeError):
-        return None
+def fmt_money(n):
+    return f"{fmt(n)} ₽"
 
-def enrich(products):
-    """Добавляет показатели к каждому товару."""
-    result = []
-    for p in products:
-        m = calc_metrics(p)
-        if m:
-            p.update(m)
-            result.append(p)
-    return result
 
-# ==================== ТОПЫ ====================
+# ==================== КЭШ МЕНЮ ====================
+def main_menu():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📊 Сводка", callback_data="daily"),
+        types.InlineKeyboardButton("🚨 Горящие", callback_data="burning"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📉 Просрочки", callback_data="overdue"),
+        types.InlineKeyboardButton("🔥 Топ SKU", callback_data="sku"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📅 По дням", callback_data="daily_chart"),
+        types.InlineKeyboardButton("💰 Деньги", callback_data="money"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📦 Склад", callback_data="stock"),
+        types.InlineKeyboardButton("🔄 Возвраты", callback_data="returns"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("👥 Клиенты", callback_data="customers"),
+        types.InlineKeyboardButton("📍 ПВЗ", callback_data="pvz"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💾 Экономия", callback_data="saved"),
+        types.InlineKeyboardButton("❓ Помощь", callback_data="help"),
+    )
+    return kb
 
-def top_selling(products, n=10):
-    """Самые продаваемые — по числу отзывов."""
-    return sorted(products, key=lambda p: p.get('reviews', 0), reverse=True)[:n]
 
-def top_rated(products, n=10):
-    """Топ по рейтингу (10+ отзывов)."""
-    filtered = [p for p in products if p.get('reviews', 0) >= 10]
-    return sorted(filtered, key=lambda p: p.get('rating', 0), reverse=True)[:n]
+def back_menu():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔙 В меню", callback_data="back"))
+    return kb
 
-def top_margin(products, n=10):
-    """Топ по марже."""
-    return sorted(products, key=lambda p: p.get('margin', 0), reverse=True)[:n]
 
-def top_roi(products, n=10):
-    """Топ по ROI."""
-    return sorted(products, key=lambda p: p.get('roi', 0), reverse=True)[:n]
-
-def problems(products):
-    """Проблемные SKU."""
-    margin_th = get_float('ALERTS', 'margin_threshold')
-    rating_th = get_float('ALERTS', 'rating_threshold')
-    discount_th = get_float('ALERTS', 'discount_threshold')
-    
-    low_margin = [p for p in products if p.get('margin', 0) < margin_th]
-    low_rating = [p for p in products if p.get('rating', 0) < rating_th and p.get('reviews', 0) > 100]
-    high_discount = [p for p in products if p.get('discount', 0) > discount_th]
-    
+# ==================== ХЕЛПЕРЫ ЭКРАНОВ ====================
+def get_metrics():
+    row = q("""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE assembled_at IS NOT NULL) AS assembled,
+            COUNT(*) FILTER (WHERE assembled_at > deadline) AS overdue,
+            COUNT(*) FILTER (WHERE assembled_at IS NULL AND deadline < NOW()) AS burning,
+            COUNT(*) FILTER (WHERE status = 'new') AS new_orders,
+            COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+            COUNT(*) FILTER (WHERE status = 'returned') AS returned
+        FROM orders
+    """).iloc[0]
+    total = int(row["total"])
+    assembled = int(row["assembled"])
+    overdue = int(row["overdue"])
+    pct = round(100.0 * overdue / assembled, 2) if assembled else 0.0
+    penalty = overdue * PENALTY_RUB
+    target_count = assembled * TARGET_OVERDUE_PCT / 100.0
+    saved_month = max(0, overdue - target_count) * PENALTY_RUB
     return {
-        'low_margin': low_margin,
-        'low_rating': low_rating,
-        'high_discount': high_discount,
+        "total": total, "assembled": assembled, "overdue": overdue,
+        "pct": pct, "penalty": penalty,
+        "saved_month": saved_month, "saved_year": saved_month * 12,
+        "burning": int(row["burning"]), "new": int(row["new_orders"]),
+        "cancelled": int(row["cancelled"]), "returned": int(row["returned"]),
     }
 
-def brand_summary(products):
-    """Сводка по брендам."""
-    brands = {}
-    for p in products:
-        b = p.get('brand', '—') or '—'
-        brands.setdefault(b, []).append(p)
-    
-    result = []
-    for brand, items in brands.items():
-        margins = [i.get('margin', 0) for i in items]
-        result.append({
-            'brand': brand,
-            'count': len(items),
-            'avg_margin': round(sum(margins) / len(margins), 1) if margins else 0,
-        })
-    return sorted(result, key=lambda x: x['avg_margin'], reverse=True)
 
-# ==================== КЛАВИАТУРЫ ====================
-
-def main_kb():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("🔥 Самые продаваемые", callback_data="top_selling"),
-        types.InlineKeyboardButton("⭐ Топ по рейтингу", callback_data="top_rated"),
-        types.InlineKeyboardButton("💰 Топ по марже", callback_data="top_margin"),
-        types.InlineKeyboardButton("📈 Топ по ROI", callback_data="top_roi"),
-        types.InlineKeyboardButton("📊 Сводка по брендам", callback_data="brands"),
-        types.InlineKeyboardButton("💹 Общая экономика", callback_data="economy"),
-        types.InlineKeyboardButton("🚨 Проблемные SKU", callback_data="problems"),
-    )
-    return kb
-
-def back_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="main"))
-    return kb
-
-# ==================== ЭКРАНЫ ====================
-
-def screen_main(chat_id, msg_id=None):
-    text = (
-        "💎 <b>WB Jewelry Monitor</b>\n\n"
-        "Демо-бот для анализа товаров WB.\n"
-        "Данные — из Google Таблицы.\n"
-        "Ключевые показатели: маржа, ROI, прибыль, скидка.\n\n"
-        "Выберите отчёт:"
-    )
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=main_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=main_kb())
-
-def format_product_row(i, p):
-    """Форматирует строку товара с показателями."""
-    name = str(p.get('name', '—'))[:35]
-    margin = p.get('margin', '—')
-    profit = p.get('profit', '—')
-    rating = p.get('rating', '—')
-    reviews = p.get('reviews', 0)
-    return (
-        f"{i}. <b>{name}</b>\n"
-        f"   ★{rating} | {reviews} отз. | маржа {margin}% | прибыль {profit} ₽\n"
-    )
-
-def screen_top_selling(chat_id, msg_id=None):
-    products = enrich(load_products())
-    top = top_selling(products, 10)
-    
-    text = "🔥 <b>Самые продаваемые</b>\n<i>(по числу отзывов)</i>\n\n"
-    for i, p in enumerate(top, 1):
-        text += format_product_row(i, p)
-    
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=back_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=back_kb())
-
-def screen_top_rated(chat_id, msg_id=None):
-    products = enrich(load_products())
-    top = top_rated(products, 10)
-    
-    text = "⭐ <b>Топ по рейтингу</b>\n<i>(при 10+ отзывах)</i>\n\n"
-    for i, p in enumerate(top, 1):
-        text += format_product_row(i, p)
-    
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=back_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=back_kb())
-
-def screen_top_margin(chat_id, msg_id=None):
-    products = enrich(load_products())
-    top = top_margin(products, 10)
-    
-    text = "💰 <b>Топ по марже</b>\n\n"
-    for i, p in enumerate(top, 1):
-        text += format_product_row(i, p)
-    
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=back_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=back_kb())
-
-def screen_top_roi(chat_id, msg_id=None):
-    products = enrich(load_products())
-    top = top_roi(products, 10)
-    
-    text = "📈 <b>Топ по ROI</b>\n<i>(окупаемость себестоимости)</i>\n\n"
-    for i, p in enumerate(top, 1):
-        name = str(p.get('name', '—'))[:35]
-        roi = p.get('roi', '—')
-        margin = p.get('margin', '—')
-        profit = p.get('profit', '—')
-        text += f"{i}. <b>{name}</b>\n"
-        text += f"   ROI {roi}% | маржа {margin}% | прибыль {profit} ₽\n"
-    
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=back_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=back_kb())
-
-def screen_brands(chat_id, msg_id=None):
-    products = enrich(load_products())
-    summary = brand_summary(products)
-    
-    text = "📊 <b>Сводка по брендам</b>\n\n"
-    for i, b in enumerate(summary[:15], 1):
-        text += f"{i}. <b>{b['brand']}</b>\n"
-        text += f"   SKU: {b['count']} | средняя маржа: {b['avg_margin']}%\n"
-    
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=back_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=back_kb())
-
-def screen_economy(chat_id, msg_id=None):
-    products = enrich(load_products())
-    
-    if not products:
-        text = "❌ Нет данных"
-    else:
-        total = len(products)
-        profitable = sum(1 for p in products if p.get('profit', 0) > 0)
-        unprofitable = total - profitable
-        avg_margin = round(sum(p.get('margin', 0) for p in products) / total, 1)
-        avg_roi = round(sum(p.get('roi', 0) for p in products) / total, 1)
-        total_profit = round(sum(p.get('profit', 0) for p in products), 2)
-        
-        text = (
-            f"💹 <b>Общая экономика</b>\n\n"
-            f"<b>Ключевые показатели:</b>\n"
-            f"• Всего SKU: <b>{total}</b>\n"
-            f"• Прибыльных: <b>{profitable}</b>\n"
-            f"• Убыточных: <b>{unprofitable}</b>\n\n"
-            f"• Средняя маржа: <b>{avg_margin}%</b>\n"
-            f"• Средний ROI: <b>{avg_roi}%</b>\n"
-            f"• Суммарная прибыль: <b>{total_profit} ₽</b>\n\n"
-            f"<i>Параметры расчёта:</i>\n"
-            f"• Комиссия WB: {get_settings('ECONOMICS', 'commission_pct')}%\n"
-            f"• Логистика: {get_settings('ECONOMICS', 'logistics')} ₽\n"
-            f"• Хранение: {get_settings('ECONOMICS', 'storage')} ₽\n"
-            f"• Себестоимость: {get_settings('ECONOMICS', 'cost_pct')}%"
-        )
-    
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=back_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=back_kb())
-
-def screen_problems(chat_id, msg_id=None):
-    products = enrich(load_products())
-    pr = problems(products)
-    
-    total = sum(len(v) for v in pr.values())
-    
-    if total == 0:
-        text = "✅ <b>Проблем не найдено</b>\n\nВсе SKU в норме."
-    else:
-        text = f"🚨 <b>Проблемные SKU</b> (всего: {total})\n\n"
-        
-        if pr['low_margin']:
-            text += f"<b>💸 Низкая маржа</b> ({len(pr['low_margin'])}):\n"
-            for p in pr['low_margin'][:5]:
-                name = str(p.get('name', '—'))[:30]
-                text += f"• {name}: {p.get('margin')}%\n"
-            if len(pr['low_margin']) > 5:
-                text += f"  ...и ещё {len(pr['low_margin']) - 5}\n"
-            text += "\n"
-        
-        if pr['low_rating']:
-            text += f"<b>⭐ Низкий рейтинг</b> ({len(pr['low_rating'])}):\n"
-            for p in pr['low_rating'][:5]:
-                name = str(p.get('name', '—'))[:30]
-                text += f"• {name}: ★{p.get('rating')} ({p.get('reviews')} отз.)\n"
-            if len(pr['low_rating']) > 5:
-                text += f"  ...и ещё {len(pr['low_rating']) - 5}\n"
-            text += "\n"
-        
-        if pr['high_discount']:
-            text += f"<b>🔥 Большая скидка</b> ({len(pr['high_discount'])}):\n"
-            for p in pr['high_discount'][:5]:
-                name = str(p.get('name', '—'))[:30]
-                text += f"• {name}: -{p.get('discount')}%\n"
-            if len(pr['high_discount']) > 5:
-                text += f"  ...и ещё {len(pr['high_discount']) - 5}\n"
-    
-    if msg_id:
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='html', reply_markup=back_kb())
-    else:
-        bot.send_message(chat_id, text, parse_mode='html', reply_markup=back_kb())
-
-# ==================== ОБРАБОТЧИКИ ====================
-
-@bot.message_handler(commands=['start'])
+# ==================== КОМАНДЫ ====================
+@bot.message_handler(commands=["start", "menu"])
 def cmd_start(message):
-    screen_main(message.chat.id)
-
-@bot.callback_query_handler(func=lambda c: True)
-def handle_callback(call):
-    chat_id = call.message.chat.id
-    msg_id = call.message.message_id
-    
     try:
-        if call.data == "main":
-            screen_main(chat_id, msg_id)
-        elif call.data == "top_selling":
-            screen_top_selling(chat_id, msg_id)
-        elif call.data == "top_rated":
-            screen_top_rated(chat_id, msg_id)
-        elif call.data == "top_margin":
-            screen_top_margin(chat_id, msg_id)
-        elif call.data == "top_roi":
-            screen_top_roi(chat_id, msg_id)
-        elif call.data == "brands":
-            screen_brands(chat_id, msg_id)
-        elif call.data == "economy":
-            screen_economy(chat_id, msg_id)
-        elif call.data == "problems":
-            screen_problems(chat_id, msg_id)
-        else:
-            bot.answer_callback_query(call.id, "Неизвестное действие")
-            return
+        m = get_metrics()
+        txt = (
+            "💎 <b>WB Demo — мониторинг FBS</b>\n\n"
+            f"Заказов: <b>{fmt(m['total'])}</b>\n"
+            f"Просрочек: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)\n"
+            f"Горящих сейчас: <b>{fmt(m['burning'])}</b>\n\n"
+            "Выбери раздел:"
+        )
+        bot.send_message(message.chat.id, txt, reply_markup=main_menu())
+    except Exception as e:
+        bot.send_message(message.chat.id, f"⚠️ Ошибка: <code>{e}</code>")
+
+
+@bot.message_handler(commands=["help"])
+def cmd_help(message):
+    txt = (
+        "📖 <b>Помощь</b>\n\n"
+        "<b>📊 Сводка</b> — ключевые метрики\n"
+        "<b>🚨 Горящие</b> — заказы с истёкшим дедлайном\n"
+        "<b>📉 Просрочки</b> — по ПВЗ\n"
+        "<b>🔥 Топ SKU</b> — топ-10 по % просрочек\n"
+        "<b>📅 По дням</b> — динамика за 14 дней\n"
+        "<b>💰 Деньги</b> — выручка, маржа, штрафы\n"
+        "<b>📦 Склад</b> — дефицит\n"
+        "<b>🔄 Возвраты</b> — доля и причины\n"
+        "<b>👥 Клиенты</b> — сегменты, регионы\n"
+        "<b>📍 ПВЗ</b> — рейтинг и загрузка\n"
+        "<b>💾 Экономия</b> — потенциал\n\n"
+        "Команды: /start /menu /help /daily /burning /overdue /money"
+    )
+    bot.send_message(message.chat.id, txt, reply_markup=main_menu())
+
+
+# ==================== CALLBACK ====================
+@bot.callback_query_handler(func=lambda call: True)
+def on_callback(call):
+    try:
+        handlers = {
+            "daily": show_daily,
+            "burning": show_burning,
+            "overdue": show_overdue,
+            "sku": show_sku,
+            "daily_chart": show_daily_chart,
+            "money": show_money,
+            "stock": show_stock,
+            "returns": show_returns,
+            "customers": show_customers,
+            "pvz": show_pvz,
+            "saved": show_saved,
+        }
+        if call.data == "back":
+            m = get_metrics()
+            bot.edit_message_text(
+                f"📋 <b>Главное меню</b>\n\nПросрочек: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=main_menu(),
+            )
+        elif call.data == "help":
+            cmd_help(call.message)
+        elif call.data in handlers:
+            handlers[call.data](call.message)
         bot.answer_callback_query(call.id)
     except Exception as e:
-        logger.error(f'Callback error: {e}')
-        bot.answer_callback_query(call.id, f"Ошибка: {e}")
+        bot.answer_callback_query(call.id, "Ошибка")
+        bot.send_message(call.message.chat.id, f"⚠️ <code>{e}</code>")
 
-@bot.message_handler(func=lambda m: True)
-def handle_text(message):
-    screen_main(message.chat.id)
+
+# ==================== ЭКРАНЫ ====================
+def show_daily(message):
+    m = get_metrics()
+    txt = (
+        "📊 <b>Ключевые метрики</b>\n\n"
+        f"Всего заказов: <b>{fmt(m['total'])}</b>\n"
+        f"Собрано: <b>{fmt(m['assembled'])}</b>\n"
+        f"Просрочено: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)\n"
+        f"Горящих сейчас: <b>{fmt(m['burning'])}</b>\n\n"
+        f"Новых: {fmt(m['new'])}\n"
+        f"Отменено: {fmt(m['cancelled'])}\n"
+        f"Возвратов: {fmt(m['returned'])}\n\n"
+        f"Штрафы/мес: <b>{fmt_money(m['penalty'])}</b>\n"
+        f"Цель: {TARGET_OVERDUE_PCT}% просрочек"
+    )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_burning(message):
+    df = q("""
+        SELECT o.wb_order_id, s.sku_code, o.pvz, o.deadline,
+               round((EXTRACT(EPOCH FROM (NOW() - o.deadline))/3600.0)::numeric, 1) AS hours_late
+        FROM orders o
+        LEFT JOIN skus s ON s.sku_id = o.sku_id
+        WHERE o.assembled_at IS NULL AND o.deadline < NOW()
+        ORDER BY o.deadline
+        LIMIT 25
+    """)
+    if df.empty:
+        bot.send_message(message.chat.id, "✅ Горящих заказов нет", reply_markup=back_menu())
+        return
+    txt = f"🚨 <b>Горящие заказы ({len(df)})</b>\n\n"
+    for _, r in df.iterrows():
+        txt += (
+            f"• <code>{r['wb_order_id']}</code> / {r['sku_code'] or '—'}\n"
+            f"   {r['pvz']} · опоздание <b>{r['hours_late']} ч</b>\n"
+        )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_overdue(message):
+    df = q("""
+        SELECT pvz,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE assembled_at > deadline) AS overdue,
+               round((100.0 * COUNT(*) FILTER (WHERE assembled_at > deadline)
+                     / NULLIF(COUNT(*), 0))::numeric, 2) AS pct
+        FROM orders
+        WHERE assembled_at IS NOT NULL
+        GROUP BY pvz
+        ORDER BY pct DESC
+    """)
+    txt = "📉 <b>Просрочки по ПВЗ</b>\n\n"
+    for _, r in df.iterrows():
+        emo = "🔴" if r["pct"] >= 15 else ("🟡" if r["pct"] >= 10 else "🟢")
+        txt += (
+            f"{emo} <b>{r['pvz']}</b>\n"
+            f"   Всего: {int(r['total'])} · Просрочек: <b>{int(r['overdue'])}</b> ({r['pct']}%)\n\n"
+        )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_sku(message):
+    df = q("""
+        SELECT s.sku_code, s.category,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE o.assembled_at > o.deadline) AS overdue,
+               round((100.0 * COUNT(*) FILTER (WHERE o.assembled_at > o.deadline)
+                     / NULLIF(COUNT(*), 0))::numeric, 2) AS pct
+        FROM orders o
+        JOIN skus s ON s.sku_id = o.sku_id
+        WHERE o.assembled_at IS NOT NULL
+        GROUP BY s.sku_code, s.category
+        HAVING COUNT(*) >= 10
+        ORDER BY pct DESC
+        LIMIT 10
+    """)
+    txt = "🔥 <b>Топ-10 SKU по % просрочек</b>\n\n"
+    for i, (_, r) in enumerate(df.iterrows(), 1):
+        txt += (
+            f"{i}. <code>{r['sku_code']}</code> — {r['category']}\n"
+            f"   <b>{r['pct']}%</b> ({int(r['overdue'])}/{int(r['total'])})\n\n"
+        )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_daily_chart(message):
+    df = q("""
+        SELECT DATE(created_at) AS day,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE assembled_at > deadline) AS overdue
+        FROM orders
+        WHERE assembled_at IS NOT NULL
+          AND created_at >= NOW() - INTERVAL '14 days'
+        GROUP BY DATE(created_at)
+        ORDER BY day
+    """)
+    if df.empty:
+        bot.send_message(message.chat.id, "Нет данных за 14 дней", reply_markup=back_menu())
+        return
+    txt = "📅 <b>Последние 14 дней</b>\n\n<pre>"
+    for _, r in df.iterrows():
+        bar = "█" * min(int(r["overdue"] / 2) + 1, 25)
+        txt += f"{str(r['day'])[5:]}  {int(r['overdue']):>3}  {bar}\n"
+    txt += "</pre>"
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_money(message):
+    df = q("""
+        SELECT
+            COALESCE(SUM(revenue), 0) AS revenue,
+            COALESCE(SUM(commission), 0) AS commission,
+            COALESCE(SUM(logistics_cost), 0) AS logistics,
+            COALESCE(SUM(ads_cost), 0) AS ads,
+            COALESCE(SUM(penalty), 0) AS penalty,
+            COALESCE(SUM(profit), 0) AS profit
+        FROM finance
+    """).iloc[0]
+    margin = round(100.0 * df["profit"] / df["revenue"], 2) if df["revenue"] else 0
+    txt = (
+        "💰 <b>Деньги</b>\n\n"
+        f"Выручка: <b>{fmt_money(df['revenue'])}</b>\n"
+        f"Комиссия WB: {fmt_money(df['commission'])}\n"
+        f"Логистика: {fmt_money(df['logistics'])}\n"
+        f"Реклама: {fmt_money(df['ads'])}\n"
+        f"Штрафы: {fmt_money(df['penalty'])}\n\n"
+        f"Прибыль: <b>{fmt_money(df['profit'])}</b>\n"
+        f"Маржа: <b>{margin}%</b>"
+    )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_stock(message):
+    df = q("""
+        SELECT s.sku_code, s.category,
+               COALESCE(SUM(st.qty), 0) AS stock,
+               COUNT(DISTINCT o.order_id) AS orders_pending
+        FROM skus s
+        LEFT JOIN stocks st ON st.sku_id = s.sku_id
+        LEFT JOIN orders o ON o.sku_id = s.sku_id
+            AND o.assembled_at IS NULL AND o.status = 'new'
+        GROUP BY s.sku_code, s.category
+        HAVING COUNT(DISTINCT o.order_id) > 0 OR COALESCE(SUM(st.qty), 0) = 0
+        ORDER BY orders_pending DESC, stock ASC
+        LIMIT 15
+    """)
+    if df.empty:
+        bot.send_message(message.chat.id, "✅ Дефицита нет", reply_markup=back_menu())
+        return
+    txt = "📦 <b>Дефицит / ожидаемые заказы</b>\n\n"
+    for _, r in df.iterrows():
+        txt += (
+            f"• <code>{r['sku_code']}</code> ({r['category']})\n"
+            f"   Остаток: <b>{int(r['stock'])}</b> · Ждут: {int(r['orders_pending'])}\n"
+        )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_returns(message):
+    m = q("""
+        SELECT
+            (SELECT COUNT(*) FROM orders) AS total,
+            (SELECT COUNT(*) FROM returns) AS returns
+    """).iloc[0]
+    pct = round(100.0 * m["returns"] / m["total"], 2) if m["total"] else 0
+    top = q("""
+        SELECT reason, COUNT(*) AS cnt
+        FROM returns
+        GROUP BY reason
+        ORDER BY cnt DESC
+    """)
+    txt = (
+        "🔄 <b>Возвраты</b>\n\n"
+        f"Всего: <b>{fmt(m['returns'])}</b> из {fmt(m['total'])} ({pct}%)\n\n"
+        "<b>Причины:</b>\n"
+    )
+    for _, r in top.iterrows():
+        txt += f"• {r['reason']}: {int(r['cnt'])}\n"
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_customers(message):
+    seg = q("""
+        SELECT segment, COUNT(*) AS cnt
+        FROM customers
+        GROUP BY segment
+        ORDER BY cnt DESC
+    """)
+    reg = q("""
+        SELECT region, COUNT(*) AS cnt
+        FROM customers
+        GROUP BY region
+        ORDER BY cnt DESC
+    """)
+    txt = "👥 <b>Клиенты</b>\n\n<b>Сегменты:</b>\n"
+    for _, r in seg.iterrows():
+        txt += f"• {r['segment']}: {int(r['cnt'])}\n"
+    txt += "\n<b>Регионы:</b>\n"
+    for _, r in reg.iterrows():
+        txt += f"• {r['region']}: {int(r['cnt'])}\n"
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_pvz(message):
+    df = q("""
+        SELECT pvz, region, rating, reviews, avg_delivery_hours, load_pct
+        FROM pvz_ratings
+        ORDER BY rating DESC
+    """)
+    txt = "📍 <b>ПВЗ</b>\n\n"
+    for _, r in df.iterrows():
+        emo = "🟢" if r["rating"] >= 4.5 else ("🟡" if r["rating"] >= 4.0 else "🔴")
+        txt += (
+            f"{emo} <b>{r['pvz']}</b> ({r['region']})\n"
+            f"   Рейтинг: {r['rating']} · Отзывов: {int(r['reviews'])}\n"
+            f"   Доставка: {r['avg_delivery_hours']} ч · Загрузка: {r['load_pct']}%\n\n"
+        )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+def show_saved(message):
+    m = get_metrics()
+    txt = (
+        "💾 <b>Потенциал экономии</b>\n\n"
+        f"Сейчас просрочек: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)\n"
+        f"Штрафы: <b>{fmt_money(m['penalty'])}</b>\n\n"
+        f"Цель: <b>{TARGET_OVERDUE_PCT}%</b>\n"
+        f"Экономия/мес: <b>{fmt_money(m['saved_month'])}</b>\n"
+        f"Экономия/год: <b>{fmt_money(m['saved_year'])}</b>\n\n"
+        "Способ: автоматические напоминания сборщикам\n"
+        "за 2 часа до дедлайна + эскалация менеджеру."
+    )
+    bot.send_message(message.chat.id, txt, reply_markup=back_menu())
+
+
+# ==================== КОМАНДЫ ДУБЛЁРЫ ====================
+@bot.message_handler(commands=["daily"])
+def c_daily(m): show_daily(m)
+
+@bot.message_handler(commands=["burning"])
+def c_burning(m): show_burning(m)
+
+@bot.message_handler(commands=["overdue"])
+def c_overdue(m): show_overdue(m)
+
+@bot.message_handler(commands=["money"])
+def c_money(m): show_money(m)
+
+
+# ==================== ФОНОВЫЕ АЛЕРТЫ ====================
+_last_alert = {"burning": None, "overdue_pct": None, "returns_pct": None, "daily": None}
+
+
+def send_admin(text):
+    if not ADMIN_ID:
+        return
+    try:
+        bot.send_message(ADMIN_ID, text)
+    except Exception:
+        pass
+
+
+def check_alerts():
+    try:
+        m = get_metrics()
+        # 1. Горящие > 10
+        if m["burning"] > 10:
+            key = ("burning", m["burning"])
+            if _last_alert["burning"] != key:
+                send_admin(
+                    f"🚨 <b>Алерт: {m['burning']} горящих заказов</b>\n\n"
+                    f"Дедлайн прошёл, но не собраны.\n"
+                    f"Открой /burning для списка."
+                )
+                _last_alert["burning"] = key
+        else:
+            _last_alert["burning"] = None
+
+        # 2. Просрочки > 12%
+        if m["pct"] > 12:
+            if _last_alert["overdue_pct"] != round(m["pct"], 1):
+                send_admin(
+                    f"📉 <b>Алерт: просрочки {m['pct']}%</b>\n\n"
+                    f"Выше порога 12%.\n"
+                    f"Штрафы: {fmt_money(m['penalty'])}"
+                )
+                _last_alert["overdue_pct"] = round(m["pct"], 1)
+        else:
+            _last_alert["overdue_pct"] = None
+
+        # 3. Возвраты > 18%
+        ret_pct = round(100.0 * m["returned"] / m["total"], 2) if m["total"] else 0
+        if ret_pct > 18:
+            if _last_alert["returns_pct"] != round(ret_pct, 1):
+                send_admin(f"🔄 <b>Алерт: возвраты {ret_pct}%</b>\n\nВыше порога 18%.")
+                _last_alert["returns_pct"] = round(ret_pct, 1)
+        else:
+            _last_alert["returns_pct"] = None
+    except Exception as e:
+        print(f"[alert] error: {e}")
+
+
+def scheduler_loop():
+    """Фоновый поток: алерты + утренняя сводка."""
+    last_daily_date = None
+    while True:
+        try:
+            now = datetime.now()
+            # Алерты
+            check_alerts()
+            # Утренняя сводка
+            if now.hour == DAILY_HOUR and last_daily_date != now.date():
+                m = get_metrics()
+                send_admin(
+                    f"☀️ <b>Утренняя сводка {now.strftime('%d.%m.%Y')}</b>\n\n"
+                    f"Заказов: {fmt(m['total'])}\n"
+                    f"Просрочек: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)\n"
+                    f"Горящих: <b>{fmt(m['burning'])}</b>\n"
+                    f"Штрафы: {fmt_money(m['penalty'])}\n\n"
+                    f"Открой /menu для деталей."
+                )
+                last_daily_date = now.date()
+        except Exception as e:
+            print(f"[scheduler] error: {e}")
+        time.sleep(ALERT_INTERVAL_MIN * 60)
+
 
 # ==================== ЗАПУСК ====================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("WB Demo Bot — запуск")
+    print("=" * 60)
 
-if __name__ == '__main__':
-    logger.info('=== WB Jewelry Monitor запущен ===')
-    bot.infinity_polling()
+    if TOKEN == "ВСТАВЬ_ТОКЕН_СЮДА":
+        print("❌ ОШИБКА: не вставлен TOKEN")
+        print("   Получи у @BotFather и замени 'ВСТАВЬ_ТОКЕН_СЮДА'")
+        exit(1)
+
+    # Проверка БД
+    try:
+        n = scalar("SELECT COUNT(*) FROM orders")
+        print(f"✅ БД подключена. Заказов: {n}")
+    except Exception as e:
+        print(f"❌ Ошибка БД: {e}")
+        exit(1)
+
+    if ADMIN_ID:
+        print(f"✅ ADMIN_ID: {ADMIN_ID} (алерты включены)")
+    else:
+        print("⚠️ ADMIN_ID не задан — алерты выключены")
+
+    # Фоновый поток
+    t = threading.Thread(target=scheduler_loop, daemon=True)
+    t.start()
+    print(f"✅ Планировщик запущен (алерты каждые {ALERT_INTERVAL_MIN} мин, сводка в {DAILY_HOUR}:00)")
+    print()
+    print("📱 Открой Telegram и напиши боту /start")
+    print("=" * 60)
+
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+        except Exception as e:
+            print(f"[polling] error: {e}")
+            traceback.print_exc()
+            time.sleep(5)
