@@ -1,0 +1,4 @@
+pyTelegramBotAPI
+pandas
+sqlalchemy
+psycopg[binary]
