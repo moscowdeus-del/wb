@@ -1,32 +1,76 @@
 # -*- coding: utf-8 -*-
 """
 WB Demo — Telegram-бот мониторинга FBS.
-Все данные из PostgreSQL wb_demo. Локальный polling.
+Патч curl_cffi для обхода TLS-обрывов.
 
 Перед запуском:
-1. Вставь TOKEN от @BotFather
-2. Вставь ADMIN_ID (узнать: напиши @userinfobot в Telegram)
-3. pip install pyTelegramBotAPI pandas sqlalchemy "psycopg[binary]"
+1. pip install curl_cffi pyTelegramBotAPI pandas sqlalchemy "psycopg[binary]"
+2. Вставь TOKEN от @BotFather
+3. Вставь ADMIN_ID (узнать: @userinfobot)
 4. python bot.py
 """
+
+# ==================== ПАТЧ CURL_CFFI ====================
+# Заставляем requests использовать TLS-стек curl (обходит SSL-обрывы)
+try:
+    from curl_cffi import requests as curl_requests
+    import requests
+    import requests.adapters
+    import requests.sessions
+    import urllib3
+
+    class CurlCffiAdapter(requests.adapters.BaseAdapter):
+        def send(self, request, **kwargs):
+            resp = curl_requests.request(
+                method=request.method,
+                url=request.url,
+                headers=dict(request.headers),
+                data=request.body,
+                timeout=kwargs.get("timeout", 30),
+                impersonate="chrome",
+            )
+            r = requests.Response()
+            r.status_code = resp.status_code
+            r.headers.update(resp.headers)
+            r._content = resp.content
+            r.url = request.url
+            r.request = request
+            r.encoding = "utf-8"
+            return r
+
+        def close(self):
+            pass
+
+    # Патчим Session.get_adapter — все запросы идут через curl_cffi
+    _orig_get_adapter = requests.sessions.Session.get_adapter
+    def _patched_get_adapter(self, url):
+        if url.startswith("https://"):
+            return CurlCffiAdapter()
+        return _orig_get_adapter(self, url)
+    requests.sessions.Session.get_adapter = _patched_get_adapter
+    print("✅ Патч curl_cffi активен — TLS как у Chrome")
+except ImportError:
+    print("⚠️ curl_cffi не установлен. Работаем без патча.")
+    print("   Установи: pip install curl_cffi")
+
+
 import telebot
 from telebot import types
 import pandas as pd
 from sqlalchemy import create_engine, text
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 import time
 import traceback
 
 # ==================== НАСТРОЙКИ ====================
 TOKEN = "8483036781:AAHhqpdVe39EtuJdMrWho1BjwSH1cEfA3C8"
-ADMIN_ID = 6011810304  # ← твой chat_id (число), узнать: @userinfobot
+ADMIN_ID = 6011810304
 DB_URL = "postgresql+psycopg://postgres:1234@localhost:5432/wb_demo"
 PENALTY_RUB = 500
 TARGET_OVERDUE_PCT = 2.0
-BURNING_HOURS = 2       # за сколько часов до дедлайна считать «горящим»
-ALERT_INTERVAL_MIN = 30  # как часто проверять алерты (минут)
-DAILY_HOUR = 9          # во сколько слать утреннюю сводку
+ALERT_INTERVAL_MIN = 30
+DAILY_HOUR = 9
 
 engine = create_engine(DB_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -34,19 +78,16 @@ bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 # ==================== БД ====================
 def q(sql, params=None):
-    """Выполнить SQL, вернуть DataFrame."""
     with engine.connect() as c:
         return pd.read_sql(text(sql), c, params=params or {})
 
 
 def scalar(sql, params=None):
-    """Один скаляр."""
     with engine.connect() as c:
         return c.execute(text(sql), params or {}).scalar()
 
 
 def fmt(n):
-    """1234567 -> '1 234 567'"""
     try:
         return f"{int(n):,}".replace(",", " ")
     except Exception:
@@ -57,33 +98,15 @@ def fmt_money(n):
     return f"{fmt(n)} ₽"
 
 
-# ==================== КЭШ МЕНЮ ====================
-def main_menu():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("📊 Сводка", callback_data="daily"),
-        types.InlineKeyboardButton("🚨 Горящие", callback_data="burning"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("📉 Просрочки", callback_data="overdue"),
-        types.InlineKeyboardButton("🔥 Топ SKU", callback_data="sku"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("📅 По дням", callback_data="daily_chart"),
-        types.InlineKeyboardButton("💰 Деньги", callback_data="money"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("📦 Склад", callback_data="stock"),
-        types.InlineKeyboardButton("🔄 Возвраты", callback_data="returns"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("👥 Клиенты", callback_data="customers"),
-        types.InlineKeyboardButton("📍 ПВЗ", callback_data="pvz"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("💾 Экономия", callback_data="saved"),
-        types.InlineKeyboardButton("❓ Помощь", callback_data="help"),
-    )
+# ==================== КЛАВИАТУРЫ ====================
+def reply_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(types.KeyboardButton("📊 Сводка"), types.KeyboardButton("🚨 Горящие"))
+    kb.add(types.KeyboardButton("📉 Просрочки"), types.KeyboardButton("🔥 Топ SKU"))
+    kb.add(types.KeyboardButton("💰 Деньги"), types.KeyboardButton("📦 Склад"))
+    kb.add(types.KeyboardButton("🔄 Возвраты"), types.KeyboardButton("👥 Клиенты"))
+    kb.add(types.KeyboardButton("📍 ПВЗ"), types.KeyboardButton("💾 Экономия"))
+    kb.add(types.KeyboardButton("📅 По дням"), types.KeyboardButton("❓ Помощь"))
     return kb
 
 
@@ -93,7 +116,7 @@ def back_menu():
     return kb
 
 
-# ==================== ХЕЛПЕРЫ ЭКРАНОВ ====================
+# ==================== МЕТРИКИ ====================
 def get_metrics():
     row = q("""
         SELECT
@@ -132,9 +155,9 @@ def cmd_start(message):
             f"Заказов: <b>{fmt(m['total'])}</b>\n"
             f"Просрочек: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)\n"
             f"Горящих сейчас: <b>{fmt(m['burning'])}</b>\n\n"
-            "Выбери раздел:"
+            "Кнопки меню — внизу экрана."
         )
-        bot.send_message(message.chat.id, txt, reply_markup=main_menu())
+        bot.send_message(message.chat.id, txt, reply_markup=reply_menu())
     except Exception as e:
         bot.send_message(message.chat.id, f"⚠️ Ошибка: <code>{e}</code>")
 
@@ -156,24 +179,18 @@ def cmd_help(message):
         "<b>💾 Экономия</b> — потенциал\n\n"
         "Команды: /start /menu /help /daily /burning /overdue /money"
     )
-    bot.send_message(message.chat.id, txt, reply_markup=main_menu())
+    bot.send_message(message.chat.id, txt, reply_markup=reply_menu())
 
 
-# ==================== CALLBACK ====================
 @bot.callback_query_handler(func=lambda call: True)
 def on_callback(call):
     try:
         handlers = {
-            "daily": show_daily,
-            "burning": show_burning,
-            "overdue": show_overdue,
-            "sku": show_sku,
-            "daily_chart": show_daily_chart,
-            "money": show_money,
-            "stock": show_stock,
-            "returns": show_returns,
-            "customers": show_customers,
-            "pvz": show_pvz,
+            "daily": show_daily, "burning": show_burning,
+            "overdue": show_overdue, "sku": show_sku,
+            "daily_chart": show_daily_chart, "money": show_money,
+            "stock": show_stock, "returns": show_returns,
+            "customers": show_customers, "pvz": show_pvz,
             "saved": show_saved,
         }
         if call.data == "back":
@@ -182,7 +199,6 @@ def on_callback(call):
                 f"📋 <b>Главное меню</b>\n\nПросрочек: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                reply_markup=main_menu(),
             )
         elif call.data == "help":
             cmd_help(call.message)
@@ -192,6 +208,41 @@ def on_callback(call):
     except Exception as e:
         bot.answer_callback_query(call.id, "Ошибка")
         bot.send_message(call.message.chat.id, f"⚠️ <code>{e}</code>")
+
+
+@bot.message_handler(func=lambda m: m.text in (
+    "📊 Сводка", "🚨 Горящие", "📉 Просрочки", "🔥 Топ SKU",
+    "💰 Деньги", "📦 Склад", "🔄 Возвраты", "👥 Клиенты",
+    "📍 ПВЗ", "💾 Экономия", "📅 По дням", "❓ Помощь",
+))
+def on_reply_button(message):
+    try:
+        mapping = {
+            "📊 Сводка": show_daily, "🚨 Горящие": show_burning,
+            "📉 Просрочки": show_overdue, "🔥 Топ SKU": show_sku,
+            "💰 Деньги": show_money, "📦 Склад": show_stock,
+            "🔄 Возвраты": show_returns, "👥 Клиенты": show_customers,
+            "📍 ПВЗ": show_pvz, "💾 Экономия": show_saved,
+            "📅 По дням": show_daily_chart, "❓ Помощь": cmd_help,
+        }
+        fn = mapping.get(message.text)
+        if fn:
+            fn(message)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"⚠️ Ошибка: <code>{e}</code>")
+
+
+@bot.message_handler(commands=["daily"])
+def c_daily(m): show_daily(m)
+
+@bot.message_handler(commands=["burning"])
+def c_burning(m): show_burning(m)
+
+@bot.message_handler(commands=["overdue"])
+def c_overdue(m): show_overdue(m)
+
+@bot.message_handler(commands=["money"])
+def c_money(m): show_money(m)
 
 
 # ==================== ЭКРАНЫ ====================
@@ -241,10 +292,8 @@ def show_overdue(message):
                COUNT(*) FILTER (WHERE assembled_at > deadline) AS overdue,
                round((100.0 * COUNT(*) FILTER (WHERE assembled_at > deadline)
                      / NULLIF(COUNT(*), 0))::numeric, 2) AS pct
-        FROM orders
-        WHERE assembled_at IS NOT NULL
-        GROUP BY pvz
-        ORDER BY pct DESC
+        FROM orders WHERE assembled_at IS NOT NULL
+        GROUP BY pvz ORDER BY pct DESC
     """)
     txt = "📉 <b>Просрочки по ПВЗ</b>\n\n"
     for _, r in df.iterrows():
@@ -263,13 +312,10 @@ def show_sku(message):
                COUNT(*) FILTER (WHERE o.assembled_at > o.deadline) AS overdue,
                round((100.0 * COUNT(*) FILTER (WHERE o.assembled_at > o.deadline)
                      / NULLIF(COUNT(*), 0))::numeric, 2) AS pct
-        FROM orders o
-        JOIN skus s ON s.sku_id = o.sku_id
+        FROM orders o JOIN skus s ON s.sku_id = o.sku_id
         WHERE o.assembled_at IS NOT NULL
         GROUP BY s.sku_code, s.category
-        HAVING COUNT(*) >= 10
-        ORDER BY pct DESC
-        LIMIT 10
+        HAVING COUNT(*) >= 10 ORDER BY pct DESC LIMIT 10
     """)
     txt = "🔥 <b>Топ-10 SKU по % просрочек</b>\n\n"
     for i, (_, r) in enumerate(df.iterrows(), 1):
@@ -282,17 +328,14 @@ def show_sku(message):
 
 def show_daily_chart(message):
     df = q("""
-        SELECT DATE(created_at) AS day,
-               COUNT(*) AS total,
+        SELECT DATE(created_at) AS day, COUNT(*) AS total,
                COUNT(*) FILTER (WHERE assembled_at > deadline) AS overdue
-        FROM orders
-        WHERE assembled_at IS NOT NULL
+        FROM orders WHERE assembled_at IS NOT NULL
           AND created_at >= NOW() - INTERVAL '14 days'
-        GROUP BY DATE(created_at)
-        ORDER BY day
+        GROUP BY DATE(created_at) ORDER BY day
     """)
     if df.empty:
-        bot.send_message(message.chat.id, "Нет данных за 14 дней", reply_markup=back_menu())
+        bot.send_message(message.chat.id, "Нет данных", reply_markup=back_menu())
         return
     txt = "📅 <b>Последние 14 дней</b>\n\n<pre>"
     for _, r in df.iterrows():
@@ -304,13 +347,12 @@ def show_daily_chart(message):
 
 def show_money(message):
     df = q("""
-        SELECT
-            COALESCE(SUM(revenue), 0) AS revenue,
-            COALESCE(SUM(commission), 0) AS commission,
-            COALESCE(SUM(logistics_cost), 0) AS logistics,
-            COALESCE(SUM(ads_cost), 0) AS ads,
-            COALESCE(SUM(penalty), 0) AS penalty,
-            COALESCE(SUM(profit), 0) AS profit
+        SELECT COALESCE(SUM(revenue), 0) AS revenue,
+               COALESCE(SUM(commission), 0) AS commission,
+               COALESCE(SUM(logistics_cost), 0) AS logistics,
+               COALESCE(SUM(ads_cost), 0) AS ads,
+               COALESCE(SUM(penalty), 0) AS penalty,
+               COALESCE(SUM(profit), 0) AS profit
         FROM finance
     """).iloc[0]
     margin = round(100.0 * df["profit"] / df["revenue"], 2) if df["revenue"] else 0
@@ -338,8 +380,7 @@ def show_stock(message):
             AND o.assembled_at IS NULL AND o.status = 'new'
         GROUP BY s.sku_code, s.category
         HAVING COUNT(DISTINCT o.order_id) > 0 OR COALESCE(SUM(st.qty), 0) = 0
-        ORDER BY orders_pending DESC, stock ASC
-        LIMIT 15
+        ORDER BY orders_pending DESC, stock ASC LIMIT 15
     """)
     if df.empty:
         bot.send_message(message.chat.id, "✅ Дефицита нет", reply_markup=back_menu())
@@ -355,17 +396,11 @@ def show_stock(message):
 
 def show_returns(message):
     m = q("""
-        SELECT
-            (SELECT COUNT(*) FROM orders) AS total,
-            (SELECT COUNT(*) FROM returns) AS returns
+        SELECT (SELECT COUNT(*) FROM orders) AS total,
+               (SELECT COUNT(*) FROM returns) AS returns
     """).iloc[0]
     pct = round(100.0 * m["returns"] / m["total"], 2) if m["total"] else 0
-    top = q("""
-        SELECT reason, COUNT(*) AS cnt
-        FROM returns
-        GROUP BY reason
-        ORDER BY cnt DESC
-    """)
+    top = q("SELECT reason, COUNT(*) AS cnt FROM returns GROUP BY reason ORDER BY cnt DESC")
     txt = (
         "🔄 <b>Возвраты</b>\n\n"
         f"Всего: <b>{fmt(m['returns'])}</b> из {fmt(m['total'])} ({pct}%)\n\n"
@@ -377,18 +412,8 @@ def show_returns(message):
 
 
 def show_customers(message):
-    seg = q("""
-        SELECT segment, COUNT(*) AS cnt
-        FROM customers
-        GROUP BY segment
-        ORDER BY cnt DESC
-    """)
-    reg = q("""
-        SELECT region, COUNT(*) AS cnt
-        FROM customers
-        GROUP BY region
-        ORDER BY cnt DESC
-    """)
+    seg = q("SELECT segment, COUNT(*) AS cnt FROM customers GROUP BY segment ORDER BY cnt DESC")
+    reg = q("SELECT region, COUNT(*) AS cnt FROM customers GROUP BY region ORDER BY cnt DESC")
     txt = "👥 <b>Клиенты</b>\n\n<b>Сегменты:</b>\n"
     for _, r in seg.iterrows():
         txt += f"• {r['segment']}: {int(r['cnt'])}\n"
@@ -401,8 +426,7 @@ def show_customers(message):
 def show_pvz(message):
     df = q("""
         SELECT pvz, region, rating, reviews, avg_delivery_hours, load_pct
-        FROM pvz_ratings
-        ORDER BY rating DESC
+        FROM pvz_ratings ORDER BY rating DESC
     """)
     txt = "📍 <b>ПВЗ</b>\n\n"
     for _, r in df.iterrows():
@@ -430,22 +454,8 @@ def show_saved(message):
     bot.send_message(message.chat.id, txt, reply_markup=back_menu())
 
 
-# ==================== КОМАНДЫ ДУБЛЁРЫ ====================
-@bot.message_handler(commands=["daily"])
-def c_daily(m): show_daily(m)
-
-@bot.message_handler(commands=["burning"])
-def c_burning(m): show_burning(m)
-
-@bot.message_handler(commands=["overdue"])
-def c_overdue(m): show_overdue(m)
-
-@bot.message_handler(commands=["money"])
-def c_money(m): show_money(m)
-
-
 # ==================== ФОНОВЫЕ АЛЕРТЫ ====================
-_last_alert = {"burning": None, "overdue_pct": None, "returns_pct": None, "daily": None}
+_last_alert = {"burning": None, "overdue_pct": None, "returns_pct": None}
 
 
 def send_admin(text):
@@ -460,52 +470,38 @@ def send_admin(text):
 def check_alerts():
     try:
         m = get_metrics()
-        # 1. Горящие > 10
         if m["burning"] > 10:
             key = ("burning", m["burning"])
             if _last_alert["burning"] != key:
-                send_admin(
-                    f"🚨 <b>Алерт: {m['burning']} горящих заказов</b>\n\n"
-                    f"Дедлайн прошёл, но не собраны.\n"
-                    f"Открой /burning для списка."
-                )
+                send_admin(f"🚨 <b>Алерт: {m['burning']} горящих</b>\n\nОткрой /burning")
                 _last_alert["burning"] = key
         else:
             _last_alert["burning"] = None
 
-        # 2. Просрочки > 12%
         if m["pct"] > 12:
             if _last_alert["overdue_pct"] != round(m["pct"], 1):
-                send_admin(
-                    f"📉 <b>Алерт: просрочки {m['pct']}%</b>\n\n"
-                    f"Выше порога 12%.\n"
-                    f"Штрафы: {fmt_money(m['penalty'])}"
-                )
+                send_admin(f"📉 <b>Алерт: просрочки {m['pct']}%</b>\n\nШтрафы: {fmt_money(m['penalty'])}")
                 _last_alert["overdue_pct"] = round(m["pct"], 1)
         else:
             _last_alert["overdue_pct"] = None
 
-        # 3. Возвраты > 18%
         ret_pct = round(100.0 * m["returned"] / m["total"], 2) if m["total"] else 0
         if ret_pct > 18:
             if _last_alert["returns_pct"] != round(ret_pct, 1):
-                send_admin(f"🔄 <b>Алерт: возвраты {ret_pct}%</b>\n\nВыше порога 18%.")
+                send_admin(f"🔄 <b>Алерт: возвраты {ret_pct}%</b>")
                 _last_alert["returns_pct"] = round(ret_pct, 1)
         else:
             _last_alert["returns_pct"] = None
     except Exception as e:
-        print(f"[alert] error: {e}")
+        print(f"[alert] {e}")
 
 
 def scheduler_loop():
-    """Фоновый поток: алерты + утренняя сводка."""
     last_daily_date = None
     while True:
         try:
             now = datetime.now()
-            # Алерты
             check_alerts()
-            # Утренняя сводка
             if now.hour == DAILY_HOUR and last_daily_date != now.date():
                 m = get_metrics()
                 send_admin(
@@ -513,12 +509,11 @@ def scheduler_loop():
                     f"Заказов: {fmt(m['total'])}\n"
                     f"Просрочек: <b>{fmt(m['overdue'])}</b> ({m['pct']}%)\n"
                     f"Горящих: <b>{fmt(m['burning'])}</b>\n"
-                    f"Штрафы: {fmt_money(m['penalty'])}\n\n"
-                    f"Открой /menu для деталей."
+                    f"Штрафы: {fmt_money(m['penalty'])}"
                 )
                 last_daily_date = now.date()
         except Exception as e:
-            print(f"[scheduler] error: {e}")
+            print(f"[scheduler] {e}")
         time.sleep(ALERT_INTERVAL_MIN * 60)
 
 
@@ -529,11 +524,9 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if TOKEN == "ВСТАВЬ_ТОКЕН_СЮДА":
-        print("❌ ОШИБКА: не вставлен TOKEN")
-        print("   Получи у @BotFather и замени 'ВСТАВЬ_ТОКЕН_СЮДА'")
+        print("❌ Не вставлен TOKEN. Получи у @BotFather.")
         exit(1)
 
-    # Проверка БД
     try:
         n = scalar("SELECT COUNT(*) FROM orders")
         print(f"✅ БД подключена. Заказов: {n}")
@@ -546,7 +539,6 @@ if __name__ == "__main__":
     else:
         print("⚠️ ADMIN_ID не задан — алерты выключены")
 
-    # Фоновый поток
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
     print(f"✅ Планировщик запущен (алерты каждые {ALERT_INTERVAL_MIN} мин, сводка в {DAILY_HOUR}:00)")
@@ -556,8 +548,7 @@ if __name__ == "__main__":
 
     while True:
         try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+            bot.infinity_polling(timeout=15, long_polling_timeout=15)
         except Exception as e:
             print(f"[polling] error: {e}")
-            traceback.print_exc()
             time.sleep(5)
