@@ -1,59 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 WB Demo — Telegram-бот мониторинга FBS.
-Патч curl_cffi для обхода TLS-обрывов.
+Читает токен и настройки из переменных окружения (для BotHost).
 
-Перед запуском:
-1. pip install curl_cffi pyTelegramBotAPI pandas sqlalchemy "psycopg[binary]"
-2. Вставь TOKEN от @BotFather
-3. Вставь ADMIN_ID (узнать: @userinfobot)
-4. python bot.py
+Переменные окружения:
+- TELEGRAM_BOT_TOKEN — токен от @BotFather
+- ADMIN_ID — твой chat_id (узнать: @userinfobot)
+- DATABASE_URL — строка подключения к PostgreSQL
 """
-
-# ==================== ПАТЧ CURL_CFFI ====================
-# Заставляем requests использовать TLS-стек curl (обходит SSL-обрывы)
-try:
-    from curl_cffi import requests as curl_requests
-    import requests
-    import requests.adapters
-    import requests.sessions
-    import urllib3
-
-    class CurlCffiAdapter(requests.adapters.BaseAdapter):
-        def send(self, request, **kwargs):
-            resp = curl_requests.request(
-                method=request.method,
-                url=request.url,
-                headers=dict(request.headers),
-                data=request.body,
-                timeout=kwargs.get("timeout", 30),
-                impersonate="chrome",
-            )
-            r = requests.Response()
-            r.status_code = resp.status_code
-            r.headers.update(resp.headers)
-            r._content = resp.content
-            r.url = request.url
-            r.request = request
-            r.encoding = "utf-8"
-            return r
-
-        def close(self):
-            pass
-
-    # Патчим Session.get_adapter — все запросы идут через curl_cffi
-    _orig_get_adapter = requests.sessions.Session.get_adapter
-    def _patched_get_adapter(self, url):
-        if url.startswith("https://"):
-            return CurlCffiAdapter()
-        return _orig_get_adapter(self, url)
-    requests.sessions.Session.get_adapter = _patched_get_adapter
-    print("✅ Патч curl_cffi активен — TLS как у Chrome")
-except ImportError:
-    print("⚠️ curl_cffi не установлен. Работаем без патча.")
-    print("   Установи: pip install curl_cffi")
-
-
+import os
 import telebot
 from telebot import types
 import pandas as pd
@@ -63,14 +18,21 @@ import threading
 import time
 import traceback
 
-# ==================== НАСТРОЙКИ ====================
-TOKEN = "8483036781:AAHhqpdVe39EtuJdMrWho1BjwSH1cEfA3C8"
-ADMIN_ID = 6011810304
-DB_URL = "postgresql+psycopg://postgres:1234@localhost:5432/wb_demo"
+# ==================== НАСТРОЙКИ ИЗ ENV ====================
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+DB_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg://postgres:1234@localhost:5432/wb_demo"
+)
 PENALTY_RUB = 500
 TARGET_OVERDUE_PCT = 2.0
 ALERT_INTERVAL_MIN = 30
 DAILY_HOUR = 9
+
+if not TOKEN:
+    print("❌ Не задан TELEGRAM_BOT_TOKEN в переменных окружения!")
+    exit(1)
 
 engine = create_engine(DB_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -523,32 +485,28 @@ if __name__ == "__main__":
     print("WB Demo Bot — запуск")
     print("=" * 60)
 
-    if TOKEN == "ВСТАВЬ_ТОКЕН_СЮДА":
-        print("❌ Не вставлен TOKEN. Получи у @BotFather.")
-        exit(1)
-
     try:
         n = scalar("SELECT COUNT(*) FROM orders")
         print(f"✅ БД подключена. Заказов: {n}")
     except Exception as e:
         print(f"❌ Ошибка БД: {e}")
+        print("   Проверь DATABASE_URL")
         exit(1)
 
     if ADMIN_ID:
-        print(f"✅ ADMIN_ID: {ADMIN_ID} (алерты включены)")
+        print(f"✅ ADMIN_ID: {ADMIN_ID}")
     else:
-        print("⚠️ ADMIN_ID не задан — алерты выключены")
+        print("⚠️ ADMIN_ID не задан")
 
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
-    print(f"✅ Планировщик запущен (алерты каждые {ALERT_INTERVAL_MIN} мин, сводка в {DAILY_HOUR}:00)")
-    print()
-    print("📱 Открой Telegram и напиши боту /start")
+    print(f"✅ Планировщик запущен")
+    print("📱 Открой Telegram и напиши /start")
     print("=" * 60)
 
     while True:
         try:
-            bot.infinity_polling(timeout=15, long_polling_timeout=15)
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
         except Exception as e:
             print(f"[polling] error: {e}")
             time.sleep(5)
